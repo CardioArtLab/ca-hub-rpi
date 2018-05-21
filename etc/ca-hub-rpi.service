@@ -1,0 +1,11 @@
+[Unit]
+Description=ZeroMQ pull server and bluetooth peripheral service
+
+[Service]
+Type=simple
+TimeoutStopSec=3
+ExecStart=/usr/bin/python3 /opt/ca-hub-rpi/zmq2bluetooth.py
+
+[Install]
+RequiredBy=ca-hub-rpi@.service
+WantedBy=multi-user.target

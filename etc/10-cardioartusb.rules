@@ -1,0 +1,6 @@
+#Resource:
+# https://wiki.archlinux.org/index.php/udev
+# https://jlk.fjfi.cvut.cz/arch/manpages/man/udev.7.en
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="10c4", ATTR{idProduct}=="8a40", TAG+="systemd", ENV{SYSTEMD_WANTS}="ca-hub-rpi@$attr{busnum}:$attr{devnum}.service"
+ACTION=="remove", SUBSYSTEM=="usb", ENV{ID_VENDOR_ID}=="10c4", ENV{ID_MODEL_ID}=="8a40", TAG-="systemd", ENV{SYSTEMD_WANTS}-="ca-hub-rpi@$attr{busnum}:$attr{devnum}.service"

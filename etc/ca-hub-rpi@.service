@@ -1,0 +1,7 @@
+[Unit]
+Description=Service handler for USB2MQ
+
+[Service]
+Type=simple
+TimeoutStopSec=3
+ExecStart=/usr/bin/python /opt/ca-hub-rpi/usb2mq.py %I
