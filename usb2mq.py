@@ -12,6 +12,7 @@ import os
 import signal
 import struct
 import sys
+import time
 
 import usb1 as _usb1
 import zmq as _zmq
@@ -41,9 +42,6 @@ sender.linger = 250
 sender.connect('tcp://127.0.0.1:6372')
 LOG.info('connect zmq pull server')
 
-# header in zmq packet
-header = ((int(bus) & 0x0F) << 4) | (int(address) & 0x0F)
-
 def send(*arr):
     if not sender:
         return
@@ -62,7 +60,7 @@ def shutdown(signum, frame):
     LOG.info('Shutting down...')
     if running and not sender.closed:
         running = False
-        send([2, header, productId])
+        send([2, int(bus), int(address), productId])
     running = False
     if handle is not None:
         handle.releaseInterface(0)
@@ -96,8 +94,8 @@ try:
             device = _device
             break
 except (RuntimeError, IOError, _usb1.USBError) as e:
-    LOG.error("Unexpected error: %s", e)
-    send([3, header, productId], str(e))
+    LOG.error("Unexpected error 1: %s", str(e))
+    send([3, int(bus), int(address), productId], str(e))
     shutdown(0, 0)
 
 if device is None:
@@ -116,8 +114,9 @@ def mainloop():
     try:
         handle = device.open()
         handle.claimInterface(0)
-        send([1, header, productId])
+        send([1, int(bus), int(address), productId])
         running = True
+        #scheduler = sched.scheduler(time.time, time.sleep)
 
         while running:
             try:
@@ -126,18 +125,20 @@ def mainloop():
                 if productId == hardware.SPO2_PRODUCT_ID:
                     assert len(data) == 6
                     isValid = True
+                    time.sleep(1.0/hardware.SPO2_SAMPLING_RATE_HZ/1.5)
                 elif productId == hardware.ECG_PRODUCT_ID:
                     assert len(data) == 27
                     isValid = True
+                    time.sleep(1.0/hardware.ECG_SAMPLING_RATE_HZ/1.5)
                 if isValid and running:
-                    send([0, header, productId], data)
+                    send([0, int(bus), int(address), productId], data)
             except _usb1.USBErrorInterrupted as e:
-                LOG.error(e)
-                send([3, header, productId], str(e))
+                LOG.error("USB Error: %s", str(e))
+                send([3, int(bus), int(address), productId], str(e))
                 shutdown(0, 0)
-    except (RuntimeError, IOError, _usb1.USBError):
-        LOG.error("Unexpected error: %s", sys.exc_info()[0])
-        send([3, header, productId], str(sys.exc_info()[0]))
+    except (RuntimeError, IOError, _usb1.USBError) as e:
+        LOG.error("Unexpected error 3: %s", str(e))
+        send([3, int(bus), int(address), productId], str(e))
 
 if __name__ == '__main__':
     mainloop()

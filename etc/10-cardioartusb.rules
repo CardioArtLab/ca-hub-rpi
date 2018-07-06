@@ -1,3 +1,7 @@
+# Set bluetooth power up
+ACTION=="add", KERNEL=="hci0", RUN+="/usr/bin/hciconfig hci0 up"
+ACTION=="add", KERNEL=="hci0", RUN+="/usr/bin/hciconfig hci0 piscan"
+
 #Resource:
 # https://wiki.archlinux.org/index.php/udev
 # https://jlk.fjfi.cvut.cz/arch/manpages/man/udev.7.en

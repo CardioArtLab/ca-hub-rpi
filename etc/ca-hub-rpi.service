@@ -8,4 +8,4 @@ ExecStart=/usr/bin/python3 /opt/ca-hub-rpi/zmq2bluetooth.py
 
 [Install]
 RequiredBy=ca-hub-rpi@.service
-WantedBy=multi-user.target
+WantedBy=multi-user.target,bluetooth.target

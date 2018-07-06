@@ -7,110 +7,112 @@ binds pull socket to tcp://localhost:6372
 Author: Jirawat I. <nodtem66@gmail.com>
 Python version: 3.5
 """
+import copy
 import os
 import signal
-import threading
+import queue
+#import threading
+from multiprocessing import Queue, Process, Manager
 
 import bluetooth
 import zmq
-from ringbuffer import ringbuffer
 from logger import getLogger
 
 # logger variabler
 LOG = getLogger('zmq-sink')
 
 # zmq instance
-context = zmq.Context()
+MAX_BUFFER_LENGTH = 120000
 zmeSvr = None
-
-class ZmqServer(threading.Thread):
-    def __init__(self, out_ring):
-        self.receiver = context.socket(zmq.PULL)
-        self.receiver.bind('tcp://127.0.0.1:6372')
+class ZmqServer(Process):
+    def __init__(self, q, devices, errors):
         self.running = True
-        self.out_ring = out_ring
-        self.errors = []
-        self.devices = {}
-        self.buffer = ''
-        threading.Thread.__init__(self, name='zmq-thread')
+        self.queue = q
+        self.errors = errors
+        self.devices = devices
+        self.receiver = None
         LOG.info('start pull at 127.0.0.1:6372')
-
-    def getDevices(self):
-        return self.devices
-
-    def getErrors(self):
-        e = self.errors
-        self.errors = []
-        return e
+        Process.__init__(self, name='zmq-thread')
 
     def stop(self):
         self.running = False
         if self.receiver is not None:
             self.receiver.close()
 
+    def process(self):
+        data = self.receiver.recv(flags=zmq.NOBLOCK)
+        if data:
+            if data[0] == 0:
+                try:
+                    self.queue.put_nowait(data[1:])
+                except queue.Full:
+                    self.queue.get()
+            else:
+                key = str(data[1]) + ":" + str(data[2])
+                productId = data[3]
+                if data[0] == 1:
+                    if not key in self.devices:
+                        self.devices[key] = productId
+                        LOG.info('Registered %s', key + ' ' + str(productId))
+                elif data[0] == 2 or data[0] == 3:
+                    if key in self.devices:
+                        self.devices.pop(key)
+                        LOG.info('Unregistered %s', key + ' ' + str(productId))
+                if data[0] == 3:
+                    e = key + ':' + data[4:].decode('utf8')
+                    LOG.info('ERROR %s', e)
+                    self.errors.append(e)
+
     def run(self):
+        context = zmq.Context()
+        self.receiver = context.socket(zmq.PULL)
+        self.receiver.bind('tcp://127.0.0.1:6372')
+
         while self.running:
             try:
-                data = self.receiver.recv()
-                if data:
-                    if data[0] == 0:
-                        self.buffer += data[1:] + '\n'
-                        if len(self.buffer) >= 10000:
-                            self.out_ring.try_write(self.buffer[:10000])
-                            self.buffer = self.buffer[10000:]
-                    elif data[0] == 1 or data[0] == 2:
-                        busnum = (data[1] & 0xF0) >> 4
-                        devnum = (data[1] & 0x0F)
-                        key = str(busnum) + ":" + str(devnum)
-                        productId = data[2]
-                        if data[0] == 1:
-                            if not key in self.devices:
-                                self.devices[key] = productId
-                                LOG.info('Registered %s', key + ' ' + str(productId))
-                        elif data[0] == 2:
-                            if key in self.devices:
-                                self.devices.pop(key)
-                                LOG.info('Unregistered %s', key + ' ' + str(productId))
-                    elif data[0] == 3:
-                        self.errors.append(data[1:])
-            except ringbuffer.WaitingForReaderError:
+                self.process()
+            except (zmq.Again, zmq.ZMQError):
                 pass
+            except (RuntimeError, IOError) as e:
+                LOG.error('ZMQ Error: %s', str(e))
 
 # bluetooth server instance
 BLUETOOTH_STATE_READY = 0
 BLUETOOTH_STATE_DATA = 1
 bleSvr = None
-class BluetoothServer(threading.Thread):
-    def __init__(self, in_ring, zmq_server, ring_reader, serverSocket=None, clientSocket=None):
-        if serverSocket is None:
-            self.serverSocket = serverSocket
-            self.clientSocket = clientSocket
-            self.serviceName = "CardioArtHub"
-            self.uuid = "94f39d29-716d-437d-973b-fba39e49d2e1"
-        else:
-            self.serverSocket = serverSocket
-            self.clientSocket = clientSocket
+class BluetoothServer(Process):
 
-        self.in_ring = in_ring
-        self.ring_reader = ring_reader
+    """Bluetooth server thread"""
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, q, zmq_server, devices, errors, manager):
+        self.serviceName = "CardioArtHub"
+        self.uuid = "94f39d29-716d-437d-973b-fba39e49d2e1"
+        self.queue = q
+        self.devices = devices
+        self.errors = errors
         self.zmq_server = zmq_server
+        self.manager = manager
+        self.clientSocket = None
+        self.serverSocket = None
+
         # Create the server socket
         self.getBluetoothSocket()
         # get bluetooth connection to port # of the first available
         self.getBluetoothConnection()
         # advertising bluetooth services
         self.advertiseBluetoothService()
-        # private properties
-        self.waitForExitLoop = threading.Condition()
-        self.isExitLoop = False
-        self.running = True
-        self.state = BLUETOOTH_STATE_READY;
 
-        threading.Thread.__init__(self, name='ble-thread')
+        # private properties
+        self.running = True
+        self.state = BLUETOOTH_STATE_READY
+
+        Process.__init__(self, name='ble-thread')
 
     def getBluetoothSocket(self):
         try:
             self.serverSocket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+            #self.serverSocket.setblocking(0)
             LOG.info("Bluetooth server socket successfully created for RFCOMM service...")
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
             LOG.error("Failed to create the bluetooth server socket ", exc_info=True)
@@ -147,7 +149,8 @@ class BluetoothServer(threading.Thread):
     def acceptBluetoothConnection(self):
         try:
             self.clientSocket, clientInfo = self.serverSocket.accept()
-            self.clientSocket.setblocking = False
+            #self.clientSocket.setblocking(0)
+            #self.clientSocket.settimeout(0)
             LOG.info("Accepted bluetooth connection from %s", clientInfo)
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
             LOG.error("Failed to accept bluetooth connection ... ", exc_info=True)
@@ -159,37 +162,51 @@ class BluetoothServer(threading.Thread):
             if self.serverSocket is not None:
                 self.serverSocket.close()
             LOG.info("Bluetooth sockets successfully closed ...")
-        except Exception:
+        except bluetooth.BluetoothError:
             LOG.error("Failed to close the bluetooth sockets ", exc_info=True)
+
+    def readClient(self):
+        while self.running:
+            dataRecv = self.clientSocket.recv(10)
+            if len(dataRecv) >= 3:
+                if dataRecv[0:3] == b'lst':
+                    self.state = BLUETOOTH_STATE_READY
+                    device = []
+                    devices = self.devices.copy()
+                    self.clientSocket.send(str(len(devices.keys())) + '\r\n')
+                    for k, v in devices.items():
+                        device.append(str(k)+':'+str(v))
+                    if device:
+                        self.clientSocket.send(','.join(device) + '\r\n')
+                elif dataRecv[0:3] == b'err':
+                    self.state = BLUETOOTH_STATE_READY
+                    errors = copy.deepcopy(self.errors)
+                    # clear ListProxy
+                    # see: https://stackoverflow.com/questions/23499507/how-to-clear-the-content-from-a-listproxy
+                    self.errors[:] = []
+                    self.clientSocket.send(str(len(errors)) + '\r\n')
+                    if errors:
+                        self.clientSocket.send(','.join(errors) + '\r\n')
+                elif dataRecv[0:3] == b'len':
+                    self.state = BLUETOOTH_STATE_READY
+                    self.clientSocket.send(str(self.queue.qsize()) + '\r\n')
+                elif dataRecv[0:3] == b'rdy':
+                    self.state = BLUETOOTH_STATE_DATA
+
+            try:
+                if self.state == BLUETOOTH_STATE_DATA:
+                    data = self.queue.get_nowait()
+                    self.clientSocket.send(data)
+            except queue.Empty:
+                self.state = BLUETOOTH_STATE_READY
 
     def run(self):
         while self.running:
             try:
-                # Accepting bluetooth connection
+                # Accepting new bluetooth connection
                 self.acceptBluetoothConnection()
-                while self.running:
-                    dataRecv = self.clientSocket.recv(1024)
-                    if len(dataRecv) >= 3:
-                        if dataRecv[0] == ord('l') and dataRecv[1] == ord('s') and dataRecv[2] == ord('t'):
-                            self.state = BLUETOOTH_STATE_READY
-                            devices = self.zmq_server.getDevices()
-                            self.clientSocket.send(str(len(devices.keys())) + '\r\n')
-                            for k, v in devices.items():
-                                self.clientSocket.send(str(k)+' '+str(v) + '\r\n')
-                        elif dataRecv[0] == ord('e') and dataRecv[1] == ord('r') and dataRecv[2] == ord('r'):
-                            self.state = BLUETOOTH_STATE_READY
-                            errors = self.zmq_server.getErrors()
-                            self.clientSocket.send(str(len(errors)) + '\r\n')
-                            for err in errors:
-                                self.clientSocket.send(err + '\r\n')
-                        elif dataRecv[0] == ord('r') and dataRecv[1] == ord('d') and dataRecv[2] == ord('y'):
-                            self.state = BLUETOOTH_STATE_DATA
-                    if self.state == BLUETOOTH_STATE_DATA:
-                        try:
-                            data = self.in_ring.try_read(self.ring_reader)
-                            self.clientSocket.send(data + '\r\n')
-                        except (ringbuffer.WriterFinishedError, ringbuffer.WaitingForWriterError):
-                            pass
+                # Loop to communicate with connected client
+                self.readClient()
 
             except (IOError, bluetooth.BluetoothError) as e:
                 LOG.error(e)
@@ -210,15 +227,23 @@ def shutdown(signals, frame):
 
 if __name__ == '__main__':
     # init ringbuffer
-    ring = ringbuffer.RingBuffer(slot_bytes=10000, slot_count=120)
-    ring.new_writer()
-    reader = ring.new_reader()
-    #init server instance
-    zmqSvr = ZmqServer(ring)
-    bleSvr = BluetoothServer(ring, zmq_server=zmqSvr, ring_reader=reader)
-    # register signal event
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-    # start bluetooth server
-    bleSvr.start()
-    zmqSvr.start()
+    #ring = ringbuffer.RingBuffer(slot_bytes=32, slot_count=12000)
+    #ring.new_writer()
+    #reader = ring.new_reader()
+    _q = Queue(MAX_BUFFER_LENGTH)
+
+    with Manager() as manager:
+        dev = manager.dict()
+        err = manager.list()
+        #init server instance
+        zmqSvr = ZmqServer(_q, devices=dev, errors=err)
+        bleSvr = BluetoothServer(_q, zmq_server=zmqSvr, devices=dev, errors=err, manager=manager)
+        # register signal event
+        signal.signal(signal.SIGINT, shutdown)
+        signal.signal(signal.SIGTERM, shutdown)
+        # start bluetooth server
+        bleSvr.start()
+        zmqSvr.start()
+
+        bleSvr.join()
+        zmqSvr.join()
