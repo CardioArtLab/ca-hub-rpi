@@ -9,6 +9,7 @@ Python version: 3.5
 """
 import copy
 import os
+import select
 import signal
 import queue
 #import threading
@@ -84,11 +85,14 @@ class BluetoothServer(Process):
 
     """Bluetooth server thread"""
     # pylint: disable=too-many-instance-attributes
+    # pylint: disable=too-many-branches
+    # pylint: disable=too-many-nested-blocks
 
     def __init__(self, q, zmq_server, devices, errors, manager):
         self.serviceName = "CardioArtHub"
         self.uuid = "94f39d29-716d-437d-973b-fba39e49d2e1"
         self.queue = q
+        self.internal_queue = {}
         self.devices = devices
         self.errors = errors
         self.zmq_server = zmq_server
@@ -105,14 +109,14 @@ class BluetoothServer(Process):
 
         # private properties
         self.running = True
-        self.state = BLUETOOTH_STATE_READY
+        self.state = {}
 
         Process.__init__(self, name='ble-thread')
 
     def getBluetoothSocket(self):
         try:
             self.serverSocket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-            #self.serverSocket.setblocking(0)
+            self.serverSocket.setblocking(0)
             LOG.info("Bluetooth server socket successfully created for RFCOMM service...")
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
             LOG.error("Failed to create the bluetooth server socket ", exc_info=True)
@@ -148,73 +152,100 @@ class BluetoothServer(Process):
 
     def acceptBluetoothConnection(self):
         try:
-            self.clientSocket, clientInfo = self.serverSocket.accept()
-            #self.clientSocket.setblocking(0)
+            clientSocket, clientInfo = self.serverSocket.accept()
+            clientSocket.setblocking(0)
             #self.clientSocket.settimeout(0)
             LOG.info("Accepted bluetooth connection from %s", clientInfo)
+            return clientSocket
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
             LOG.error("Failed to accept bluetooth connection ... ", exc_info=True)
 
-    def closeBluetoothSocket(self):
-        try:
-            if self.clientSocket is not None:
-                self.clientSocket.close()
-            if self.serverSocket is not None:
-                self.serverSocket.close()
-            LOG.info("Bluetooth sockets successfully closed ...")
-        except bluetooth.BluetoothError:
-            LOG.error("Failed to close the bluetooth sockets ", exc_info=True)
+    def closeSocket(self, s):
+        if s in self.internal_queue:
+            del self.internal_queue[s]
+        if s in self.state:
+            del self.state[s]
+        s.close()
 
-    def readClient(self):
-        while self.running:
-            dataRecv = self.clientSocket.recv(10)
-            if len(dataRecv) >= 3:
-                if dataRecv[0:3] == b'lst':
-                    self.state = BLUETOOTH_STATE_READY
-                    device = []
-                    devices = self.devices.copy()
-                    self.clientSocket.send(str(len(devices.keys())) + '\r\n')
-                    for k, v in devices.items():
-                        device.append(str(k)+':'+str(v))
-                    if device:
-                        self.clientSocket.send(','.join(device) + '\r\n')
-                elif dataRecv[0:3] == b'err':
-                    self.state = BLUETOOTH_STATE_READY
-                    errors = copy.deepcopy(self.errors)
-                    # clear ListProxy
-                    # see: https://stackoverflow.com/questions/23499507/how-to-clear-the-content-from-a-listproxy
-                    self.errors[:] = []
-                    self.clientSocket.send(str(len(errors)) + '\r\n')
-                    if errors:
-                        self.clientSocket.send(','.join(errors) + '\r\n')
-                elif dataRecv[0:3] == b'len':
-                    self.state = BLUETOOTH_STATE_READY
-                    self.clientSocket.send(str(self.queue.qsize()) + '\r\n')
-                elif dataRecv[0:3] == b'rdy':
-                    self.state = BLUETOOTH_STATE_DATA
+    def readClient(self, client):
+        dataRecv = client.recv(10)
+        if len(dataRecv) >= 3 and (client in self.internal_queue):
+            if dataRecv[0:3] == b'lst':
+                self.state[client] = BLUETOOTH_STATE_READY
+                device = []
+                devices = self.devices.copy()
+                msg = str(len(devices.keys()))
+                for k, v in devices.items():
+                    device.append(str(k)+':'+str(v))
+                if device:
+                    msg += '\x1f' + (','.join(device))
+                self.internal_queue[client].put(msg + '\n')
+            elif dataRecv[0:3] == b'err':
+                self.state[client] = BLUETOOTH_STATE_READY
+                errors = copy.deepcopy(self.errors)
+                # clear ListProxy
+                # see: https://stackoverflow.com/questions/23499507/how-to-clear-the-content-from-a-listproxy
+                self.errors[:] = []
+                msg = str(len(errors))
+                if errors:
+                    msg += '\x1f' + (','.join(errors))
+                self.internal_queue[client].put(msg + '\n')
+            elif dataRecv[0:3] == b'len':
+                self.state[client] = BLUETOOTH_STATE_READY
+                self.internal_queue[client].put(str(self.queue.qsize()) + '\n')
+            elif dataRecv[0:3] == b'rdy':
+                self.state[client] = BLUETOOTH_STATE_DATA
 
-            try:
-                if self.state == BLUETOOTH_STATE_DATA:
-                    data = self.queue.get_nowait()
-                    self.clientSocket.send(data)
-            except queue.Empty:
-                self.state = BLUETOOTH_STATE_READY
+        return len(dataRecv)
 
     def run(self):
-        while self.running:
+        inputs = [self.serverSocket]
+        outputs = []
+        while inputs and self.running:
             try:
-                # Accepting new bluetooth connection
-                self.acceptBluetoothConnection()
-                # Loop to communicate with connected client
-                self.readClient()
+                readable, writable, exceptional = select.select(inputs, outputs, inputs)
+                for s in readable:
+                    if s is self.serverSocket:
+                        # Accepting new bluetooth connection
+                        connection = self.acceptBluetoothConnection()
+                        inputs.append(connection)
+                        self.state[connection] = BLUETOOTH_STATE_READY
+                        self.internal_queue[connection] = queue.Queue()
+                    else:
+                        # Loop to communicate with connected client
+                        if self.readClient(s):
+                            if s not in outputs:
+                                outputs.append(s)
+                        else:
+                            # Interpret empty result as closed connection
+                            if s in outputs:
+                                outputs.remove(s)
+                            if s in inputs:
+                                inputs.remove(s)
+                            self.closeSocket(s)
+                for s in writable:
+                    try:
+                        if self.state[s] == BLUETOOTH_STATE_DATA:
+                            next_msg = self.queue.get_nowait()
+                        else:
+                            next_msg = self.internal_queue[s].get_nowait()
+                    except queue.Empty:
+                        outputs.remove(s)
+                    else:
+                        s.send(next_msg)
+                for s in exceptional:
+                    if s in outputs:
+                        outputs.remove(s)
+                    if s in inputs:
+                        inputs.remove(s)
+                    self.closeSocket(s)
 
             except (IOError, bluetooth.BluetoothError) as e:
-                LOG.error(e)
+                LOG.error(str(e))
 
     def stop(self):
         # Disconnecting bluetooth sockets
         self.running = False
-        self.closeBluetoothSocket()
 
 # shutdown event
 def shutdown(signals, frame):
