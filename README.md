@@ -10,10 +10,15 @@ $ cd /opt
 - install systemd service and udev
 ```sh
 $ ./install.sh
+$ systemctl enable ca-hub-rpi-init
 $ systemctl enable ca-hub-rpi
 $ systemctl start ca-hub-rpi
 ```
+- Due to `libusb1` use Python2 for `usb2mq.py`
+- use Python3 for `zmq2bluetooth.py`
+
 ## Functions
+- `ca-hub-rpi-init` enable inquiry scan
 - When USB bus=1 address=2 plug in, systemd will start `ca-hub-rpi@1:2`
 - Main service logging
 ```sh

@@ -21,6 +21,7 @@ from logger import getLogger
 
 # logger variabler
 LOG = getLogger('zmq-sink')
+LOGBT = getLogger('bt-server')
 
 # zmq instance
 MAX_BUFFER_LENGTH = 120000
@@ -117,26 +118,26 @@ class BluetoothServer(Process):
         try:
             self.serverSocket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
             self.serverSocket.setblocking(0)
-            LOG.info("Bluetooth server socket successfully created for RFCOMM service...")
+            LOGBT.info("Bluetooth server socket successfully created for RFCOMM service...")
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to create the bluetooth server socket ", exc_info=True)
+            LOGBT.error("Failed to create the bluetooth server socket ", exc_info=True)
 
     def getBluetoothConnection(self):
         try:
             self.serverSocket.bind(("", bluetooth.PORT_ANY))
-            LOG.info("Bluetooth server socket bind successfully on host "" to PORT_ANY...")
+            LOGBT.info("Bluetooth server socket bind successfully on host "" to PORT_ANY...")
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to bind server socket on host to PORT_ANY ... ", exc_info=True)
+            LOGBT.error("Failed to bind server socket on host to PORT_ANY ... ", exc_info=True)
         try:
             self.serverSocket.listen(1)
-            LOG.info("Bluetooth server socket put to listening mode successfully ...")
+            LOGBT.info("Bluetooth server socket put to listening mode successfully ...")
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to put server socket to listening mode  ... ", exc_info=True)
+            LOGBT.error("Failed to put server socket to listening mode  ... ", exc_info=True)
         try:
             port = self.serverSocket.getsockname()[1]
-            LOG.info("Waiting for connection on RFCOMM channel %d", port)
+            LOGBT.info("Waiting for connection on RFCOMM channel %d", port)
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to get connection on RFCOMM channel  ... ", exc_info=True)
+            LOGBT.error("Failed to get connection on RFCOMM channel  ... ", exc_info=True)
 
     def advertiseBluetoothService(self):
         try:
@@ -146,19 +147,19 @@ class BluetoothServer(Process):
                                         profiles=[bluetooth.SERIAL_PORT_PROFILE],
                                         #protocols = [ OBEX_UUID ]
                                        )
-            LOG.info("%s advertised successfully ...", self.serviceName)
+            LOGBT.info("%s advertised successfully ...", self.serviceName)
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to advertise bluetooth services  ... ", exc_info=True)
+            LOGBT.error("Failed to advertise bluetooth services  ... ", exc_info=True)
 
     def acceptBluetoothConnection(self):
         try:
             clientSocket, clientInfo = self.serverSocket.accept()
             clientSocket.setblocking(0)
             #self.clientSocket.settimeout(0)
-            LOG.info("Accepted bluetooth connection from %s", clientInfo)
+            LOGBT.info("Accepted bluetooth connection from %s", clientInfo)
             return clientSocket
         except (bluetooth.BluetoothError, SystemExit, KeyboardInterrupt):
-            LOG.error("Failed to accept bluetooth connection ... ", exc_info=True)
+            LOGBT.error("Failed to accept bluetooth connection ... ", exc_info=True)
 
     def closeSocket(self, s):
         if s in self.internal_queue:
@@ -201,10 +202,12 @@ class BluetoothServer(Process):
     def run(self):
         inputs = [self.serverSocket]
         outputs = []
+        lastSocket = None
         while inputs and self.running:
             try:
                 readable, writable, exceptional = select.select(inputs, outputs, inputs)
                 for s in readable:
+                    lastSocket = s
                     if s is self.serverSocket:
                         # Accepting new bluetooth connection
                         connection = self.acceptBluetoothConnection()
@@ -224,6 +227,7 @@ class BluetoothServer(Process):
                                 inputs.remove(s)
                             self.closeSocket(s)
                 for s in writable:
+                    lastSocket = s
                     try:
                         if self.state[s] == BLUETOOTH_STATE_DATA:
                             next_msg = self.queue.get_nowait()
@@ -234,6 +238,7 @@ class BluetoothServer(Process):
                     else:
                         s.send(next_msg)
                 for s in exceptional:
+                    lastSocket = s
                     if s in outputs:
                         outputs.remove(s)
                     if s in inputs:
@@ -241,7 +246,14 @@ class BluetoothServer(Process):
                     self.closeSocket(s)
 
             except (IOError, bluetooth.BluetoothError) as e:
-                LOG.error(str(e))
+                if lastSocket:
+                    if lastSocket in outputs:
+                        outputs.remove(lastSocket)
+                    if lastSocket in inputs:
+                        inputs.remove(lastSocket)
+                    self.closeSocket(lastSocket)
+                    lastSocket = None
+                LOGBT.error(str(e))
 
     def stop(self):
         # Disconnecting bluetooth sockets

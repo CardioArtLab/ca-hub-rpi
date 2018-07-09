@@ -1,0 +1,15 @@
+[Unit]
+Description=CA-HUB-RPI BLUETOOTH INIT
+After=bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sleep 5
+ExecStart=/bin/hciconfig hci0 piscan
+RemainAfterExit=true
+TimeoutStopSec=3
+StandardOutput=journal
+
+[Install]
+RequiredBy=ca-hub-rpi.service
